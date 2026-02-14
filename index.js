@@ -64,6 +64,7 @@ async function run() {
           firebaseUid: user.firebaseUid,
           email: user.email,
           name: user.name,
+          userId: user.userId || "",
           role: user.role || 'student',
           createdAt: new Date()
         });
@@ -110,18 +111,25 @@ async function run() {
         }
 
         const result = await projectsCollection.insertOne({
-          title: project.title,
-          description: project.description,
+          title: project.title?.trim(),
+          description: project.description?.trim(),
+          shortDescription: project.shortDescription?.trim() || "",
+          technologies: Array.isArray(project.technologies) ? project.technologies : [],
+          duration: project.duration || "",
           supervisorUid: project.supervisorUid,
-          status: 'open',
+          supervisorName: project.supervisorName || "",
+          supervisorEmail: project.supervisorEmail || "",
+          status: project.status || 'open',
           createdAt: new Date()
         });
 
         res.send(result);
+
       } catch (error) {
         res.status(500).send({ error: error.message });
       }
     });
+
 
     // Get all projects (only open projects)
     // Get all projects (with optional search)
@@ -146,6 +154,24 @@ async function run() {
       }
     });
 
+    // Get single project by id
+    app.get('/projects/:id', async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        const project = await projectsCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!project) {
+          return res.status(404).send({ message: 'Project not found' });
+        }
+
+        res.send(project);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+
 
 
     // APPLICATION RELATED APIS
@@ -153,45 +179,95 @@ async function run() {
 
 
     // Student applies to a project (prevent duplicate application)
-    app.post('/applications', async (req, res) => {
-      try {
-        const application = req.body;
+    app.post("/applications", async (req, res) => {
+      const application = req.body;
 
-        // prevent duplicate application: same student + same project
-        const existing = await applicationsCollection.findOne({
-          studentUid: application.studentUid,
-          projectId: application.projectId
-        });
-
-        if (existing) {
-          return res.status(400).send({ message: 'You already applied for this project' });
-        }
-
-        const result = await applicationsCollection.insertOne({
-          studentUid: application.studentUid,
-          projectId: application.projectId,
-          supervisorUid: application.supervisorUid,
-          status: 'pending',
-          createdAt: new Date()
-        });
-
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ error: error.message });
+      // basic validation
+      if (!application?.studentUid || !application?.projectId || !application?.supervisorUid) {
+        return res.status(400).send({ message: "Missing fields" });
       }
+
+      const existing = await applicationsCollection.findOne({
+        studentUid: application.studentUid,
+        projectId: application.projectId
+      });
+
+      if (existing) {
+        return res.status(409).send({ message: "You already applied for this project." });
+      }
+
+      const doc = {
+        ...application,
+        status: "pending",
+        createdAt: new Date()
+      };
+
+      const result = await applicationsCollection.insertOne(doc);
+      res.send(result);
     });
 
-    // Supervisor: view applications for their projects
-    app.get('/applications', async (req, res) => {
-      try {
-        const supervisorUid = req.query.supervisorUid;
 
-        if (!supervisorUid) {
-          return res.status(400).send({ message: 'supervisorUid is required' });
+    app.get("/applications", async (req, res) => {
+      try {
+        const { studentUid, supervisorUid } = req.query;
+
+        if (!studentUid && !supervisorUid) {
+          return res.status(400).send({ message: "studentUid or supervisorUid is required" });
+        }
+
+        if (supervisorUid) {
+          const apps = await applicationsCollection.aggregate([
+            { $match: { supervisorUid } },
+
+            // join project title (projectId is string, projects _id is ObjectId)
+            {
+              $lookup: {
+                from: "projects",
+                let: { pid: "$projectId" },
+                pipeline: [
+                  { $addFields: { _idStr: { $toString: "$_id" } } },
+                  { $match: { $expr: { $eq: ["$_idStr", "$$pid"] } } },
+                  { $project: { title: 1 } }
+                ],
+                as: "project"
+              }
+            },
+            { $unwind: { path: "$project", preserveNullAndEmptyArrays: true } },
+
+            // join studentId from users (match firebaseUid = studentUid)
+            {
+              $lookup: {
+                from: "users",
+                localField: "studentUid",
+                foreignField: "firebaseUid",
+                pipeline: [{ $project: { userId: 1, name: 1, email: 1 } }],
+                as: "student"
+              }
+            },
+            { $unwind: { path: "$student", preserveNullAndEmptyArrays: true } },
+
+            {
+              $project: {
+                studentUid: 1,
+                projectId: 1,
+                supervisorUid: 1,
+                status: 1,
+                createdAt: 1,
+                projectTitle: "$project.title",
+                studentId: "$student.userId",
+                studentName: "$student.name",
+                studentEmail: "$student.email"
+              }
+            },
+
+            { $sort: { createdAt: -1 } }
+          ]).toArray();
+
+          return res.send(apps);
         }
 
         const result = await applicationsCollection
-          .find({ supervisorUid })
+          .find({ studentUid })
           .sort({ createdAt: -1 })
           .toArray();
 
@@ -200,6 +276,7 @@ async function run() {
         res.status(500).send({ error: error.message });
       }
     });
+
 
 
 
@@ -298,7 +375,7 @@ async function run() {
           studentUid: submission.studentUid,
           projectId: submission.projectId,
           type: submission.type,
-          fileUrl: submission.fileUrl || '',   
+          fileUrl: submission.fileUrl || '',
           note: submission.note || '',
           feedback: '',
           createdAt: new Date()
@@ -435,13 +512,13 @@ async function run() {
         const doc = {
           studentUid: lb.studentUid,
           projectId: lb.projectId,
-          week: lb.week,           
-          date: lb.date,           
-          activities: lb.activities || '', 
-          hours: lb.hours || 0,    
+          week: lb.week,
+          date: lb.date,
+          activities: lb.activities || '',
+          hours: lb.hours || 0,
           fileUrl: lb.fileUrl || '',
           remarks: lb.remarks || '',
-          reviewed: false,         
+          reviewed: false,
           supervisorFeedback: '',
           createdAt: new Date()
         };
@@ -561,7 +638,7 @@ async function run() {
       try {
         if (!req.file) return res.status(400).send({ message: 'No file uploaded' });
 
-        const fileUrl = `/uploads/${req.file.filename}`; 
+        const fileUrl = `/uploads/${req.file.filename}`;
         res.send({ fileUrl });
       } catch (error) {
         res.status(500).send({ error: error.message });
