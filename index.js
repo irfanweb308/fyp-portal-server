@@ -45,27 +45,27 @@ async function run() {
 
 
 
-
-    app.post('/users', async (req, res) => {
+    // Save user after Firebase register
+    app.post("/users", async (req, res) => {
       try {
         const user = req.body;
 
-
-        const existingUser = await usersCollection.findOne({
-          firebaseUid: user.firebaseUid
-        });
-
-        if (existingUser) {
-          return res.send({ message: 'User already exists' });
+        if (!user?.firebaseUid || !user?.email) {
+          return res.status(400).send({ message: "firebaseUid and email are required" });
         }
 
-        // insert new user
+        // avoid duplicates
+        const existing = await usersCollection.findOne({ firebaseUid: user.firebaseUid });
+        if (existing) {
+          return res.send({ message: "User already exists" });
+        }
+
         const result = await usersCollection.insertOne({
           firebaseUid: user.firebaseUid,
           email: user.email,
-          name: user.name,
+          name: user.name || "",
           userId: user.userId || "",
-          role: user.role || 'student',
+          role: user.role || "student",
           createdAt: new Date()
         });
 
@@ -74,6 +74,40 @@ async function run() {
         res.status(500).send({ error: error.message });
       }
     });
+
+    // Update user profile (student/supervisor)
+    app.patch("/users/:firebaseUid", async (req, res) => {
+      try {
+        const firebaseUid = req.params.firebaseUid;
+
+        const {
+          faculty,
+          image,
+          icPassport,
+          academicYear,
+          currentSemester
+        } = req.body;
+
+        const updateDoc = {
+          ...(faculty !== undefined ? { faculty } : {}),
+          ...(image !== undefined ? { image } : {}),
+          ...(icPassport !== undefined ? { icPassport } : {}),
+          ...(academicYear !== undefined ? { academicYear } : {}),
+          ...(currentSemester !== undefined ? { currentSemester } : {}),
+          updatedAt: new Date()
+        };
+
+        const result = await usersCollection.updateOne(
+          { firebaseUid },
+          { $set: updateDoc }
+        );
+
+        res.send({ message: "Profile updated", result });
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
 
     // Get user by Firebase UID
     app.get('/users/:uid', async (req, res) => {
@@ -131,8 +165,7 @@ async function run() {
     });
 
 
-    // Get all projects (only open projects)
-    // Get all projects (with optional search)
+
     app.get('/projects', async (req, res) => {
       try {
         const search = req.query.search;
@@ -145,6 +178,25 @@ async function run() {
 
         const result = await projectsCollection
           .find(query)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+    app.get("/projects/mine", async (req, res) => {
+      try {
+        const { supervisorUid } = req.query;
+
+        if (!supervisorUid) {
+          return res.status(400).send({ message: "supervisorUid is required" });
+        }
+
+        const result = await projectsCollection
+          .find({ supervisorUid })
           .sort({ createdAt: -1 })
           .toArray();
 
@@ -171,41 +223,130 @@ async function run() {
       }
     });
 
+    // Supervisor: update my project
+    app.patch("/projects/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { supervisorUid, title, description, shortDescription, technologies, duration, status } = req.body;
+
+        if (!supervisorUid) {
+          return res.status(400).send({ message: "supervisorUid is required" });
+        }
+
+        // only allow owner supervisor to edit
+        const project = await projectsCollection.findOne({ _id: new ObjectId(id) });
+        if (!project) return res.status(404).send({ message: "Project not found" });
+
+        if (project.supervisorUid !== supervisorUid) {
+          return res.status(403).send({ message: "Not allowed" });
+        }
+
+        // if title is being changed, check duplicate (case-insensitive)
+        if (title && title.trim().toLowerCase() !== (project.title || "").toLowerCase()) {
+          const existing = await projectsCollection.findOne({
+            title: { $regex: `^${title.trim()}$`, $options: "i" }
+          });
+          if (existing) return res.status(400).send({ message: "Project title already exists" });
+        }
+
+        const updateDoc = {
+          ...(title !== undefined ? { title: title.trim() } : {}),
+          ...(description !== undefined ? { description: description.trim() } : {}),
+          ...(shortDescription !== undefined ? { shortDescription: shortDescription.trim() } : {}),
+          ...(technologies !== undefined ? { technologies: Array.isArray(technologies) ? technologies : [] } : {}),
+          ...(duration !== undefined ? { duration } : {}),
+          ...(status !== undefined ? { status } : {}),
+          updatedAt: new Date()
+        };
+
+        const result = await projectsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateDoc }
+        );
+
+        res.send({ message: "Project updated", result });
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+    // Delete project + delete all related applications
+    app.delete("/projects/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        // 1) delete project
+        const projectResult = await projectsCollection.deleteOne({
+          _id: new ObjectId(id)
+        });
+
+        // if project not found
+        if (projectResult.deletedCount === 0) {
+          return res.status(404).send({ message: "Project not found" });
+        }
+
+        // 2) delete ALL applications for this project (this is what you want)
+        const appsResult = await applicationsCollection.deleteMany({ projectId: id });
+
+        res.send({
+          message: "Project and related applications deleted",
+          projectDeleted: projectResult.deletedCount,
+          applicationsDeleted: appsResult.deletedCount
+        });
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
 
 
 
     // APPLICATION RELATED APIS
 
-
-
-    // Student applies to a project (prevent duplicate application)
     app.post("/applications", async (req, res) => {
-      const application = req.body;
+      try {
+        const application = req.body;
 
-      // basic validation
-      if (!application?.studentUid || !application?.projectId || !application?.supervisorUid) {
-        return res.status(400).send({ message: "Missing fields" });
+        if (!application?.studentUid || !application?.projectId || !application?.supervisorUid) {
+          return res.status(400).send({ message: "Missing fields" });
+        }
+
+        const projectObjectId = new ObjectId(application.projectId);
+
+        const bookResult = await projectsCollection.updateOne(
+          { _id: projectObjectId, isBooked: { $ne: true } },
+          { $set: { isBooked: true, bookedBy: application.studentUid, bookedAt: new Date() } }
+        );
+
+        // If no project updated => already booked
+        if (bookResult.matchedCount === 0) {
+          return res.status(409).send({
+            message: "This project already chosen, please apply for other project"
+          });
+        }
+
+        // Optional: prevent same student duplicate app (safe)
+        const existing = await applicationsCollection.findOne({
+          studentUid: application.studentUid,
+          projectId: application.projectId
+        });
+
+        if (existing) {
+          return res.status(409).send({ message: "You already applied for this project." });
+        }
+
+        const doc = {
+          ...application,
+          status: "pending",
+          createdAt: new Date()
+        };
+
+        const result = await applicationsCollection.insertOne(doc);
+        res.send(result);
+
+      } catch (error) {
+        res.status(500).send({ error: error.message });
       }
-
-      const existing = await applicationsCollection.findOne({
-        studentUid: application.studentUid,
-        projectId: application.projectId
-      });
-
-      if (existing) {
-        return res.status(409).send({ message: "You already applied for this project." });
-      }
-
-      const doc = {
-        ...application,
-        status: "pending",
-        createdAt: new Date()
-      };
-
-      const result = await applicationsCollection.insertOne(doc);
-      res.send(result);
     });
-
 
     app.get("/applications", async (req, res) => {
       try {
@@ -240,7 +381,19 @@ async function run() {
                 from: "users",
                 localField: "studentUid",
                 foreignField: "firebaseUid",
-                pipeline: [{ $project: { userId: 1, name: 1, email: 1 } }],
+                pipeline: [{
+                  $project: {
+                    userId: 1,
+                    name: 1,
+                    email: 1,
+                    faculty: 1,
+                    icPassport: 1,
+                    academicYear: 1,
+                    currentSemester: 1,
+                    image: 1
+                  }
+                }],
+
                 as: "student"
               }
             },
@@ -256,7 +409,13 @@ async function run() {
                 projectTitle: "$project.title",
                 studentId: "$student.userId",
                 studentName: "$student.name",
-                studentEmail: "$student.email"
+                studentEmail: "$student.email",
+                studentFaculty: "$student.faculty",
+                studentIcPassport: "$student.icPassport",
+                studentAcademicYear: "$student.academicYear",
+                studentCurrentSemester: "$student.currentSemester",
+                studentImage: "$student.image",
+
               }
             },
 
@@ -289,11 +448,13 @@ async function run() {
     app.patch('/applications/:id', async (req, res) => {
       try {
         const id = req.params.id;
-        const { status } = req.body;
+        const { status, reason } = req.body;
 
-        if (!status || !['accepted', 'rejected'].includes(status)) {
-          return res.status(400).send({ message: 'Valid status is required: accepted or rejected' });
+
+        if (status === "rejected" && (!reason || !reason.trim())) {
+          return res.status(400).send({ message: "Rejection reason is required" });
         }
+
 
         // get the application first (so we know which student to notify)
         const application = await applicationsCollection.findOne({ _id: new ObjectId(id) });
@@ -301,19 +462,38 @@ async function run() {
           return res.status(404).send({ message: 'Application not found' });
         }
 
-        // update status
+        const updateDoc = { status };
+
+        if (status === "rejected") {
+          updateDoc.rejectionReason = reason.trim();
+        } else {
+          updateDoc.rejectionReason = "";
+        }
+
         const result = await applicationsCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: { status } }
+          { $set: updateDoc }
         );
+
+
+        if (status === "rejected") {
+          await projectsCollection.updateOne(
+            { _id: new ObjectId(application.projectId) },
+            { $set: { isBooked: false }, $unset: { bookedBy: "", bookedAt: "" } }
+          );
+        }
 
         // create notification for student
         await notificationsCollection.insertOne({
           userUid: application.studentUid,
-          message: `Your application was ${status}.`,
+          message:
+            status === "rejected"
+              ? `Your application was rejected. Reason: ${reason.trim()}`
+              : `Your application was accepted.`,
           read: false,
           createdAt: new Date()
         });
+
 
         res.send(result);
       } catch (error) {
@@ -464,29 +644,7 @@ async function run() {
       }
     });
 
-
-    // Supervisor: delete project
-    app.delete('/projects/:id', async (req, res) => {
-      try {
-        const id = req.params.id;
-
-        const result = await projectsCollection.deleteOne({
-          _id: new ObjectId(id)
-        });
-
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ error: error.message });
-      }
-    });
-
-
-
-
-
     // LOGBOOK SUBMISSION RELATED APIS
-
-
 
     // Create weekly logbook (student)
     app.post('/logbooks', async (req, res) => {
