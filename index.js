@@ -42,6 +42,8 @@ async function run() {
     const notificationsCollection = client.db("fypDB").collection("notifications");
     const submissionsCollection = client.db("fypDB").collection("submissions");
     const logbooksCollection = client.db("fypDB").collection("logbooks");
+    const completedProjectsCollection = client.db("fypDB").collection("completedProjects");
+
 
 
 
@@ -85,7 +87,9 @@ async function run() {
           image,
           icPassport,
           academicYear,
-          currentSemester
+          currentSemester,
+          studentProfile,
+          supervisorProfile
         } = req.body;
 
         const updateDoc = {
@@ -94,6 +98,9 @@ async function run() {
           ...(icPassport !== undefined ? { icPassport } : {}),
           ...(academicYear !== undefined ? { academicYear } : {}),
           ...(currentSemester !== undefined ? { currentSemester } : {}),
+          ...(studentProfile !== undefined ? { studentProfile } : {}),
+          ...(supervisorProfile !== undefined ? { supervisorProfile } : {}),
+
           updatedAt: new Date()
         };
 
@@ -107,6 +114,7 @@ async function run() {
         res.status(500).send({ error: error.message });
       }
     });
+
 
 
     // Get user by Firebase UID
@@ -130,39 +138,45 @@ async function run() {
     // PROJECT RELATED APIS
 
 
-    // Create new project (with duplicate title check)
-    app.post('/projects', async (req, res) => {
+    app.post("/projects", async (req, res) => {
       try {
-        const project = req.body;
+        const body = req.body;
 
-        // check duplicate title (case-insensitive)
+        if (!body?.title?.trim()) {
+          return res.status(400).send({ message: "Project title is required" });
+        }
+
+        const title = body.title.trim();
+
+        // duplicate title check (case-insensitive)
         const existingProject = await projectsCollection.findOne({
-          title: { $regex: `^${project.title}$`, $options: 'i' }
+          title: { $regex: `^${title}$`, $options: "i" }
         });
 
         if (existingProject) {
-          return res.status(400).send({ message: 'Project title already exists' });
+          return res.status(400).send({ message: "Project title already exists" });
         }
 
-        const result = await projectsCollection.insertOne({
-          title: project.title?.trim(),
-          description: project.description?.trim(),
-          shortDescription: project.shortDescription?.trim() || "",
-          technologies: Array.isArray(project.technologies) ? project.technologies : [],
-          duration: project.duration || "",
-          supervisorUid: project.supervisorUid,
-          supervisorName: project.supervisorName || "",
-          supervisorEmail: project.supervisorEmail || "",
-          status: project.status || 'open',
+        const doc = {
+          title,
+          description: body.description?.trim() || "",
+          shortDescription: body.shortDescription?.trim() || "",
+          technologies: Array.isArray(body.technologies) ? body.technologies : [],
+          duration: body.duration || "",
+          supervisorUid: body.supervisorUid,
+          supervisorName: body.supervisorName || "",
+          supervisorEmail: body.supervisorEmail || "",
+          status: body.status || "open",
           createdAt: new Date()
-        });
+        };
 
+        const result = await projectsCollection.insertOne(doc);
         res.send(result);
-
       } catch (error) {
         res.status(500).send({ error: error.message });
       }
     });
+
 
 
 
@@ -298,6 +312,49 @@ async function run() {
       }
     });
 
+    app.post("/completed-projects", async (req, res) => {
+      try {
+        const body = req.body;
+
+        if (!body?.title) {
+          return res.status(400).send({ message: "title is required" });
+        }
+
+        const doc = {
+          title: body.title.trim(),
+          details: body.details || {},
+          createdAt: new Date(),
+        };
+
+        const result = await completedProjectsCollection.insertOne(doc);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+    app.get("/completed-projects", async (req, res) => {
+      try {
+        const search = req.query.search?.trim();
+
+        const query = search
+          ? { title: { $regex: search, $options: "i" } }
+          : {};
+
+        const result = await completedProjectsCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .limit(50)
+          .toArray();
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+
+
 
 
     // APPLICATION RELATED APIS
@@ -347,6 +404,51 @@ async function run() {
         res.status(500).send({ error: error.message });
       }
     });
+
+    // Student: submit a proposal application (not from posted projects)
+    app.post("/applications/proposal", async (req, res) => {
+      try {
+        const body = req.body;
+
+        // basic validation
+        if (!body?.studentUid) return res.status(400).send({ message: "studentUid is required" });
+        if (!body?.supervisorUid) return res.status(400).send({ message: "supervisorUid is required" });
+        if (!body?.projectTitle?.trim()) return res.status(400).send({ message: "projectTitle is required" });
+
+        const application = {
+          type: "proposal",
+          status: "pending",
+
+          studentUid: body.studentUid,
+          supervisorUid: body.supervisorUid,
+
+          projectTitle: body.projectTitle.trim(),
+
+          // ✅ rich data goes here (like completed projects style)
+          details: body.details || {},
+
+          createdAt: new Date()
+        };
+
+        // optional: prevent duplicates (same student + same title)
+        const existing = await applicationsCollection.findOne({
+          type: "proposal",
+          studentUid: application.studentUid,
+          projectTitle: { $regex: `^${application.projectTitle}$`, $options: "i" }
+        });
+
+        if (existing) {
+          return res.status(400).send({ message: "You already submitted this proposal title before." });
+        }
+
+        const result = await applicationsCollection.insertOne(application);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+
 
     app.get("/applications", async (req, res) => {
       try {
@@ -406,7 +508,9 @@ async function run() {
                 supervisorUid: 1,
                 status: 1,
                 createdAt: 1,
-                projectTitle: "$project.title",
+                projectTitle: { $ifNull: ["$project.title", "$projectTitle"] },
+                type: 1,
+                proposal: 1,
                 studentId: "$student.userId",
                 studentName: "$student.name",
                 studentEmail: "$student.email",
@@ -436,30 +540,79 @@ async function run() {
       }
     });
 
+    app.get("/applications/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const appDoc = await applicationsCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!appDoc) return res.status(404).send({ message: "Application not found" });
+
+        res.send(appDoc);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
 
 
+    // List supervisors for dropdown
+    app.get("/supervisors", async (req, res) => {
+      try {
+        const result = await usersCollection
+          .find({ role: "supervisor" })
+          .project({ firebaseUid: 1, name: 1, email: 1, userId: 1 })
+          .toArray();
 
-    // NOTIFICATION RELATED APIS
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
 
-
-
-    // Supervisor: accept/reject application (update status)
-    // Supervisor: accept/reject application (update status + create notification)
     app.patch('/applications/:id', async (req, res) => {
       try {
         const id = req.params.id;
-        const { status, reason } = req.body;
+        const body = req.body;
 
+        const application = await applicationsCollection.findOne({
+          _id: new ObjectId(id)
+        });
+
+        if (!application) {
+          return res.status(404).send({ message: 'Application not found' });
+        }
+        if (body.studentUid) {
+          // Only allow owner student
+          if (application.studentUid !== body.studentUid) {
+            return res.status(403).send({ message: "Not allowed to edit this proposal" });
+          }
+
+          if (application.type !== "proposal") {
+            return res.status(400).send({ message: "Only proposal can be edited" });
+          }
+
+          const updateDoc = {
+            $set: {
+              projectTitle: body.projectTitle?.trim() || application.projectTitle,
+              details: body.details || application.details,
+              updatedAt: new Date()
+            }
+          };
+
+          const result = await applicationsCollection.updateOne(
+            { _id: new ObjectId(id) },
+            updateDoc
+          );
+
+          return res.send(result);
+        }
+
+        // ===============================
+        // 2️⃣ SUPERVISOR ACCEPT / REJECT
+        // ===============================
+        const { status, reason } = body;
 
         if (status === "rejected" && (!reason || !reason.trim())) {
           return res.status(400).send({ message: "Rejection reason is required" });
-        }
-
-
-        // get the application first (so we know which student to notify)
-        const application = await applicationsCollection.findOne({ _id: new ObjectId(id) });
-        if (!application) {
-          return res.status(404).send({ message: 'Application not found' });
         }
 
         const updateDoc = { status };
@@ -475,15 +628,13 @@ async function run() {
           { $set: updateDoc }
         );
 
-
-        if (status === "rejected") {
+        if (status === "rejected" && application.projectId) {
           await projectsCollection.updateOne(
             { _id: new ObjectId(application.projectId) },
             { $set: { isBooked: false }, $unset: { bookedBy: "", bookedAt: "" } }
           );
         }
 
-        // create notification for student
         await notificationsCollection.insertOne({
           userUid: application.studentUid,
           message:
@@ -494,12 +645,13 @@ async function run() {
           createdAt: new Date()
         });
 
-
         res.send(result);
+
       } catch (error) {
         res.status(500).send({ error: error.message });
       }
     });
+
 
 
     // Student: get notifications
