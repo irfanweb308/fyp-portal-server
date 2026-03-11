@@ -52,7 +52,8 @@ async function run() {
     const activitySectionsCollection = client.db("fypDB").collection("activity_sections");
     const sectionFilesCollection = client.db("fypDB").collection("section_files");
     const announcementsCollection = client.db("fypDB").collection("announcements");
-    const studentProgressCollection = client.db("fyp_portal").collection("student_progress");
+    const studentProgressCollection = client.db("fypDB").collection("student_progress");
+    const progressTemplateCollection = client.db("fypDB").collection("progress_templates");
 
 
     function getViewer(req) {
@@ -812,6 +813,55 @@ async function run() {
       }));
     };
 
+    const mergeTemplateWithProgress = (templateItems = [], savedItems = []) => {
+      const savedMap = new Map(savedItems.map((item) => [item.id, item]));
+
+      return templateItems.map((tpl) => {
+        const old = savedMap.get(tpl.id);
+
+        return {
+          id: tpl.id,
+          label: tpl.label,
+          done: old?.done || false,
+          updatedAt: old?.updatedAt || null,
+        };
+      });
+    };
+
+    const allChecklistDone = (items = []) => {
+      if (!Array.isArray(items) || items.length === 0) return false;
+      return items.every((item) => item.done === true);
+    };
+
+    const isProjectFullyCompleted = (progressDoc = {}) => {
+      return allChecklistDone(progressDoc.ip1) && allChecklistDone(progressDoc.ip2);
+    };
+
+    const validateCompletionForm = (details = {}) => {
+      const requiredFields = [
+        "year",
+        "studentName",
+        "category",
+        "status",
+        "abstract",
+        "projectCode",
+        "supervisor",
+        "department",
+        "studentId",
+        "deploymentType",
+        "completionDate",
+        "grade",
+        "repositoryLink",
+        "problemStatement"
+      ];
+
+      const missing = requiredFields.filter(
+        (key) => !details[key] || !String(details[key]).trim()
+      );
+
+      return missing;
+    };
+
     app.get("/application-progress/:appId", async (req, res) => {
       try {
         const { appId } = req.params;
@@ -824,35 +874,252 @@ async function run() {
           return res.status(404).send({ message: "Application not found" });
         }
 
+        const template = await getProgressTemplate();
+
         const existing = await studentProgressCollection.findOne({
           applicationId: appId,
         });
 
-        if (existing) {
-          return res.send(existing);
+        // if no saved progress yet, return template-based fresh structure
+        if (!existing) {
+          const newDoc = {
+            applicationId: appId,
+            studentUid: application.studentUid || "",
+            supervisorUid: application.supervisorUid || "",
+            projectTitle: application.projectTitle || "Untitled Project",
+            type: application.type || "normal",
+            ip1: mergeTemplateWithProgress(template.ip1, []),
+            ip2: mergeTemplateWithProgress(template.ip2, []),
+            completionFormSent: false,
+            completionFormSentAt: null,
+            completionFormSentBy: "",
+            completionFormSubmitted: false,
+            completionFormSubmittedAt: null,
+            completionForm: null,
+            completedProjectId: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          const result = await studentProgressCollection.insertOne(newDoc);
+          const inserted = await studentProgressCollection.findOne({
+            _id: result.insertedId,
+          });
+
+          return res.send(inserted);
         }
 
-        const newDoc = {
-          applicationId: appId,
-          studentUid: application.studentUid || "",
-          supervisorUid: application.supervisorUid || "",
-          projectTitle: application.projectTitle || "Untitled Project",
-          type: application.type || "normal",
-          ip1: makeChecklist(DEFAULT_IP1_ITEMS),
-          ip2: makeChecklist(DEFAULT_IP2_ITEMS),
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
+        // merge latest template with saved progress
+        const mergedIp1 = mergeTemplateWithProgress(template.ip1, existing.ip1 || []);
+        const mergedIp2 = mergeTemplateWithProgress(template.ip2, existing.ip2 || []);
 
-        const result = await studentProgressCollection.insertOne(newDoc);
-        const inserted = await studentProgressCollection.findOne({
-          _id: result.insertedId,
+        // optional: save merged result back to DB so old removed items disappear permanently
+        await studentProgressCollection.updateOne(
+          { applicationId: appId },
+          {
+            $set: {
+              studentUid: application.studentUid || existing.studentUid || "",
+              supervisorUid: application.supervisorUid || existing.supervisorUid || "",
+              projectTitle: application.projectTitle || existing.projectTitle || "Untitled Project",
+              type: application.type || existing.type || "normal",
+              ip1: mergedIp1,
+              ip2: mergedIp2,
+              completionFormSent: existing?.completionFormSent || false,
+              completionFormSentAt: existing?.completionFormSentAt || null,
+              completionFormSentBy: existing?.completionFormSentBy || "",
+              completionFormSubmitted: existing?.completionFormSubmitted || false,
+              completionFormSubmittedAt: existing?.completionFormSubmittedAt || null,
+              completionForm: existing?.completionForm || null,
+              completedProjectId: existing?.completedProjectId || null,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        const updated = await studentProgressCollection.findOne({
+          applicationId: appId,
         });
 
-        res.send(inserted);
+        res.send(updated);
       } catch (error) {
         console.log(error);
         res.status(500).send({ message: "Failed to load application progress" });
+      }
+    });
+
+    app.patch("/application-progress/:appId/send-completion-form", async (req, res) => {
+      try {
+        const { appId } = req.params;
+        const { supervisorUid } = req.body;
+
+        if (!supervisorUid) {
+          return res.status(400).send({ message: "supervisorUid is required" });
+        }
+
+        const application = await applicationsCollection.findOne({
+          _id: new ObjectId(appId),
+        });
+
+        if (!application) {
+          return res.status(404).send({ message: "Application not found" });
+        }
+
+        if (application.supervisorUid !== supervisorUid) {
+          return res.status(403).send({ message: "Not allowed" });
+        }
+
+        if (!["accepted", "approved"].includes(application.status)) {
+          return res.status(400).send({ message: "Application is not accepted yet" });
+        }
+
+        const progress = await studentProgressCollection.findOne({ applicationId: appId });
+
+        if (!progress) {
+          return res.status(404).send({ message: "Progress not found" });
+        }
+
+        if (!isProjectFullyCompleted(progress)) {
+          return res.status(400).send({
+            message: "All IP1 and IP2 items must be completed first",
+          });
+        }
+
+        if (progress.completionFormSubmitted) {
+          return res.status(400).send({
+            message: "Completion form already submitted by student",
+          });
+        }
+
+        await studentProgressCollection.updateOne(
+          { applicationId: appId },
+          {
+            $set: {
+              completionFormSent: true,
+              completionFormSentAt: new Date(),
+              completionFormSentBy: supervisorUid,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        await notificationsCollection.insertOne({
+          userUid: application.studentUid,
+          message: `Your supervisor has sent the project completion form. Please complete and submit it.`,
+          read: false,
+          createdAt: new Date(),
+        });
+
+        res.send({ message: "Completion form sent successfully" });
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to send completion form" });
+      }
+    });
+
+    app.post("/application-progress/:appId/submit-completion-form", async (req, res) => {
+      try {
+        const { appId } = req.params;
+        const { studentUid, details } = req.body;
+
+        if (!studentUid) {
+          return res.status(400).send({ message: "studentUid is required" });
+        }
+
+        const application = await applicationsCollection.findOne({
+          _id: new ObjectId(appId),
+        });
+
+        if (!application) {
+          return res.status(404).send({ message: "Application not found" });
+        }
+
+        if (application.studentUid !== studentUid) {
+          return res.status(403).send({ message: "Not allowed" });
+        }
+
+        const progress = await studentProgressCollection.findOne({ applicationId: appId });
+
+        if (!progress) {
+          return res.status(404).send({ message: "Progress not found" });
+        }
+
+        if (!progress.completionFormSent) {
+          return res.status(400).send({ message: "Completion form not sent yet by supervisor" });
+        }
+
+        if (!isProjectFullyCompleted(progress)) {
+          return res.status(400).send({
+            message: "All IP1 and IP2 items must be completed first",
+          });
+        }
+
+        if (progress.completionFormSubmitted) {
+          return res.status(400).send({ message: "Completion form already submitted" });
+        }
+
+        const missing = validateCompletionForm(details || {});
+        if (missing.length) {
+          return res.status(400).send({
+            message: `Missing required fields: ${missing.join(", ")}`,
+          });
+        }
+
+        const completedDoc = {
+          title: application.projectTitle || details.title || "Untitled Project",
+          applicationId: appId,
+          studentUid: application.studentUid || "",
+          supervisorUid: application.supervisorUid || "",
+          details: {
+            year: details.year || "",
+            studentName: details.studentName || "",
+            category: details.category || "",
+            status: details.status || "Completed",
+            technologies: Array.isArray(details.technologies) ? details.technologies : [],
+            abstract: details.abstract || "",
+            projectCode: details.projectCode || "",
+            supervisor: details.supervisor || "",
+            department: details.department || "",
+            studentId: details.studentId || "",
+            deploymentType: details.deploymentType || "",
+            completionDate: details.completionDate || "",
+            grade: details.grade || "",
+            repositoryLink: details.repositoryLink || "",
+            objectives: Array.isArray(details.objectives) ? details.objectives : [],
+            features: Array.isArray(details.features) ? details.features : [],
+            problemStatement: details.problemStatement || "",
+          },
+          createdAt: new Date(),
+        };
+
+        const completedResult = await completedProjectsCollection.insertOne(completedDoc);
+
+        await studentProgressCollection.updateOne(
+          { applicationId: appId },
+          {
+            $set: {
+              completionFormSubmitted: true,
+              completionFormSubmittedAt: new Date(),
+              completionForm: details,
+              completedProjectId: completedResult.insertedId.toString(),
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        await notificationsCollection.insertOne({
+          userUid: application.supervisorUid,
+          message: `Student submitted the completed project form for "${application.projectTitle}".`,
+          read: false,
+          createdAt: new Date(),
+        });
+
+        res.send({
+          message: "Completion form submitted successfully",
+          completedProjectId: completedResult.insertedId,
+        });
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to submit completion form" });
       }
     });
 
@@ -876,9 +1143,21 @@ async function run() {
           });
         }
 
+        const template = await getProgressTemplate();
+
         const existing = await studentProgressCollection.findOne({
           applicationId: appId,
         });
+
+        const safeIp1 = mergeTemplateWithProgress(
+          template.ip1,
+          Array.isArray(ip1) ? ip1 : existing?.ip1 || []
+        );
+
+        const safeIp2 = mergeTemplateWithProgress(
+          template.ip2,
+          Array.isArray(ip2) ? ip2 : existing?.ip2 || []
+        );
 
         if (!existing) {
           const newDoc = {
@@ -887,8 +1166,8 @@ async function run() {
             supervisorUid: application.supervisorUid || "",
             projectTitle: application.projectTitle || "Untitled Project",
             type: application.type || "normal",
-            ip1: Array.isArray(ip1) ? ip1 : makeChecklist(DEFAULT_IP1_ITEMS),
-            ip2: Array.isArray(ip2) ? ip2 : makeChecklist(DEFAULT_IP2_ITEMS),
+            ip1: safeIp1,
+            ip2: safeIp2,
             createdAt: new Date(),
             updatedAt: new Date(),
           };
@@ -897,20 +1176,19 @@ async function run() {
           return res.send({ message: "Progress created successfully" });
         }
 
-        const updateDoc = {
-          projectTitle: application.projectTitle || existing.projectTitle || "Untitled Project",
-          supervisorUid: application.supervisorUid || existing.supervisorUid || "",
-          studentUid: application.studentUid || existing.studentUid || "",
-          type: application.type || existing.type || "normal",
-          updatedAt: new Date(),
-        };
-
-        if (Array.isArray(ip1)) updateDoc.ip1 = ip1;
-        if (Array.isArray(ip2)) updateDoc.ip2 = ip2;
-
         await studentProgressCollection.updateOne(
           { applicationId: appId },
-          { $set: updateDoc }
+          {
+            $set: {
+              studentUid: application.studentUid || existing.studentUid || "",
+              supervisorUid: application.supervisorUid || existing.supervisorUid || "",
+              projectTitle: application.projectTitle || existing.projectTitle || "Untitled Project",
+              type: application.type || existing.type || "normal",
+              ip1: safeIp1,
+              ip2: safeIp2,
+              updatedAt: new Date(),
+            },
+          }
         );
 
         res.send({ message: "Progress updated successfully" });
@@ -923,6 +1201,7 @@ async function run() {
     app.get("/supervisors/:uid/student-progress", async (req, res) => {
       try {
         const supervisorUid = req.params.uid;
+        const template = await getProgressTemplate();
 
         const apps = await applicationsCollection
           .find({
@@ -960,6 +1239,7 @@ async function run() {
 
         const result = apps.map((app) => {
           const appId = String(app._id);
+          const existingProgress = progressMap[appId];
 
           return {
             applicationId: appId,
@@ -971,17 +1251,46 @@ async function run() {
             },
             studentUid: app.studentUid || "",
             student: studentMap[app.studentUid] || null,
-            progress: progressMap[appId] || {
-              applicationId: appId,
-              studentUid: app.studentUid || "",
-              supervisorUid: app.supervisorUid || "",
-              projectTitle: app.projectTitle || "Untitled Project",
-              type: app.type || "normal",
-              ip1: makeChecklist(DEFAULT_IP1_ITEMS),
-              ip2: makeChecklist(DEFAULT_IP2_ITEMS),
-              createdAt: null,
-              updatedAt: null,
-            },
+            progress: existingProgress
+              ? {
+                ...existingProgress,
+                applicationId: existingProgress.applicationId || appId,
+                studentUid: existingProgress.studentUid || app.studentUid || "",
+                supervisorUid: existingProgress.supervisorUid || app.supervisorUid || "",
+                projectTitle:
+                  existingProgress.projectTitle || app.projectTitle || "Untitled Project",
+                type: existingProgress.type || app.type || "normal",
+                ip1: mergeTemplateWithProgress(template.ip1, existingProgress.ip1 || []),
+                ip2: mergeTemplateWithProgress(template.ip2, existingProgress.ip2 || []),
+                completionFormSent: existingProgress.completionFormSent || false,
+                completionFormSentAt: existingProgress.completionFormSentAt || null,
+                completionFormSentBy: existingProgress.completionFormSentBy || "",
+                completionFormSubmitted: existingProgress.completionFormSubmitted || false,
+                completionFormSubmittedAt:
+                  existingProgress.completionFormSubmittedAt || null,
+                completionForm: existingProgress.completionForm || null,
+                completedProjectId: existingProgress.completedProjectId || null,
+                createdAt: existingProgress.createdAt || null,
+                updatedAt: existingProgress.updatedAt || null,
+              }
+              : {
+                applicationId: appId,
+                studentUid: app.studentUid || "",
+                supervisorUid: app.supervisorUid || "",
+                projectTitle: app.projectTitle || "Untitled Project",
+                type: app.type || "normal",
+                ip1: mergeTemplateWithProgress(template.ip1, []),
+                ip2: mergeTemplateWithProgress(template.ip2, []),
+                completionFormSent: false,
+                completionFormSentAt: null,
+                completionFormSentBy: "",
+                completionFormSubmitted: false,
+                completionFormSubmittedAt: null,
+                completionForm: null,
+                completedProjectId: null,
+                createdAt: null,
+                updatedAt: null,
+              },
           };
         });
 
@@ -1270,6 +1579,40 @@ async function run() {
 
       } catch (error) {
         res.status(500).send({ error: error.message });
+      }
+    });
+
+    app.delete("/applications/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { supervisorUid } = req.body;
+
+        const application = await applicationsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!application) {
+          return res.status(404).send({ message: "Application not found" });
+        }
+
+        // only the assigned supervisor can delete
+        if (application.supervisorUid !== supervisorUid) {
+          return res.status(403).send({ message: "Not allowed to delete this application" });
+        }
+
+        // delete progress linked to this application too
+        await studentProgressCollection.deleteOne({
+          applicationId: id,
+        });
+
+        await applicationsCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        res.send({ message: "Application deleted successfully" });
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to delete application" });
       }
     });
 
@@ -1730,29 +2073,51 @@ async function run() {
         const { viewerUid, viewerRole } = getViewer(req);
 
         const task = await activityTasksCollection.findOne({ _id: new ObjectId(taskId) });
-        if (!task) return res.status(404).send({ message: "Task not found" });
+        if (!task) {
+          return res.status(404).send({ message: "Task not found" });
+        }
 
         // Check access using the task's activityId
         const access = await getActivityAndCheckAccess({
           activityId: task.activityId,
           viewerUid,
-          viewerRole
+          viewerRole,
         });
-        if (!access.ok) return res.status(access.code).send({ message: access.message });
+        if (!access.ok) {
+          return res.status(access.code).send({ message: access.message });
+        }
 
-        const items = await taskFilesCollection.find({ taskId }).sort({ uploadedAt: -1 }).toArray();
-        for (const f of items) {
-          if (f.type === "student" && f.uploaderUid) {
-            const student = await usersCollection.findOne(
-              { firebaseUid: f.uploaderUid },
-              { projection: { userId: 1, name: 1, email: 1 } }
-            );
+        let query = { taskId };
 
-            f.studentUserId = student?.userId || "";
-            f.studentName = student?.name || "";
-            f.studentEmail = student?.email || "";
+        // student can only see own submissions
+        if (viewerRole === "student") {
+          if (!viewerUid) {
+            return res.status(400).send({ message: "viewerUid is required" });
+          }
+          query.uploaderUid = viewerUid;
+        }
+
+        const items = await taskFilesCollection
+          .find(query)
+          .sort({ uploadedAt: -1 })
+          .toArray();
+
+        // only supervisor needs other student details
+        if (viewerRole === "supervisor") {
+          for (const f of items) {
+            if (f.type === "student" && f.uploaderUid) {
+              const student = await usersCollection.findOne(
+                { firebaseUid: f.uploaderUid },
+                { projection: { userId: 1, name: 1, email: 1 } }
+              );
+
+              f.studentUserId = student?.userId || "";
+              f.studentName = student?.name || "";
+              f.studentEmail = student?.email || "";
+            }
           }
         }
+
         res.send(items);
       } catch (e) {
         res.status(500).send({ error: e.message });
@@ -2556,6 +2921,185 @@ async function run() {
       }
     });
 
+
+    // Progress Template Related APIs
+
+    const DEFAULT_PROGRESS_TEMPLATE = {
+      ip1: [
+        { id: "ip1_1", label: "Project Title" },
+        { id: "ip1_2", label: "Background" },
+        { id: "ip1_3", label: "Problem Statement" },
+        { id: "ip1_4", label: "Aims" },
+        { id: "ip1_5", label: "Objectives" },
+        { id: "ip1_6", label: "Justification" },
+        { id: "ip1_7", label: "Scope" },
+        { id: "ip1_8", label: "Approach and Deliverables" },
+        { id: "ip1_9", label: "Major Milestone with Gantt chart" },
+        { id: "ip1_10", label: "Constraints and Assumptions" },
+        { id: "ip1_11", label: "Resources" },
+        { id: "ip1_12", label: "External Bodies Involved" },
+        { id: "ip1_13", label: "Project Plan" },
+        {
+          id: "ip1_14",
+          label: "References (At least 3 related journals papers printed and attached)",
+        },
+      ],
+      ip2: [
+        { id: "ip2_1", label: "UI/UX design done" },
+        { id: "ip2_2", label: "Backend logic and Database setup finished" },
+        { id: "ip2_3", label: "Backend APIs working properly" },
+        { id: "ip2_4", label: "Frontend connection with backend done" },
+        { id: "ip2_5", label: "Report writing Started" },
+        { id: "ip2_6", label: "Report writing done" },
+      ],
+    };
+
+    const getProgressTemplate = async () => {
+      let doc = await progressTemplateCollection.findOne({ key: "main" });
+
+      if (!doc) {
+        const newDoc = {
+          key: "main",
+          ip1: DEFAULT_PROGRESS_TEMPLATE.ip1,
+          ip2: DEFAULT_PROGRESS_TEMPLATE.ip2,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        await progressTemplateCollection.insertOne(newDoc);
+        doc = await progressTemplateCollection.findOne({ key: "main" });
+      }
+
+      return doc;
+    };
+
+    app.get("/progress-template", async (req, res) => {
+      try {
+        const doc = await getProgressTemplate();
+        res.send(doc);
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to load progress template" });
+      }
+    });
+
+    app.post("/progress-template/item", async (req, res) => {
+      try {
+        const { section, label } = req.body;
+
+        if (!["ip1", "ip2"].includes(section)) {
+          return res.status(400).send({ message: "Invalid section" });
+        }
+
+        if (!label || !label.trim()) {
+          return res.status(400).send({ message: "Label is required" });
+        }
+
+        const doc = await getProgressTemplate();
+
+        const newItem = {
+          id: `${section}_${Date.now()}`,
+          label: label.trim(),
+        };
+
+        const updatedList = Array.isArray(doc[section]) ? [...doc[section], newItem] : [newItem];
+
+        await progressTemplateCollection.updateOne(
+          { key: "main" },
+          {
+            $set: {
+              [section]: updatedList,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        res.send({ message: "Checklist item added successfully", item: newItem });
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to add checklist item" });
+      }
+    });
+
+    app.patch("/progress-template/item/:itemId", async (req, res) => {
+      try {
+        const { itemId } = req.params;
+        const { section, label } = req.body;
+
+        if (!["ip1", "ip2"].includes(section)) {
+          return res.status(400).send({ message: "Invalid section" });
+        }
+
+        if (!label || !label.trim()) {
+          return res.status(400).send({ message: "Label is required" });
+        }
+
+        const doc = await getProgressTemplate();
+        const items = Array.isArray(doc[section]) ? doc[section] : [];
+
+        const found = items.find((item) => item.id === itemId);
+        if (!found) {
+          return res.status(404).send({ message: "Checklist item not found" });
+        }
+
+        const updatedItems = items.map((item) =>
+          item.id === itemId
+            ? { ...item, label: label.trim() }
+            : item
+        );
+
+        await progressTemplateCollection.updateOne(
+          { key: "main" },
+          {
+            $set: {
+              [section]: updatedItems,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        res.send({ message: "Checklist item updated successfully" });
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to update checklist item" });
+      }
+    });
+
+    app.delete("/progress-template/item/:itemId", async (req, res) => {
+      try {
+        const { itemId } = req.params;
+        const { section } = req.body;
+
+        if (!["ip1", "ip2"].includes(section)) {
+          return res.status(400).send({ message: "Invalid section" });
+        }
+
+        const doc = await getProgressTemplate();
+        const items = Array.isArray(doc[section]) ? doc[section] : [];
+
+        const exists = items.some((item) => item.id === itemId);
+        if (!exists) {
+          return res.status(404).send({ message: "Checklist item not found" });
+        }
+
+        const updatedItems = items.filter((item) => item.id !== itemId);
+
+        await progressTemplateCollection.updateOne(
+          { key: "main" },
+          {
+            $set: {
+              [section]: updatedItems,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        res.send({ message: "Checklist item deleted successfully" });
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Failed to delete checklist item" });
+      }
+    });
 
 
 
